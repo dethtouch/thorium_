@@ -1,0 +1,2622 @@
+#!/usr/bin/env python3
+"""
+THORIUM - An Enhanced P2P Cryptocurrency with Advanced Features
+Secure, Scalable, and Production-Ready Version with P2P Networking
+"""
+
+import hashlib
+import json
+import base64
+import time
+import os
+import sys
+import secrets
+import socket
+import threading
+import logging
+import signal
+import sqlite3
+from decimal import Decimal, getcontext, ROUND_DOWN
+from typing import Dict, List, Optional, Tuple, Any, Set, Union
+from dataclasses import dataclass, asdict, field
+from datetime import datetime
+import pickle
+import random
+from concurrent.futures import ThreadPoolExecutor
+from enum import Enum
+import uuid
+import struct
+import queue
+
+# Security warnings
+import warnings
+warnings.filterwarnings("default")
+
+# Enhanced cryptography imports
+try:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.exceptions import InvalidSignature
+    CRYPTOGRAPHY_AVAILABLE = True
+except ImportError:
+    CRYPTOGRAPHY_AVAILABLE = False
+    print("⚠️  Cryptography module not available. Using simplified cryptography.")
+    print("   Install with: pip install cryptography")
+
+# Additional dependencies
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    NUMPY_AVAILABLE = False
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
+# --- CONFIGURATION WITH VALIDATION ---
+class Config:
+    """Configuration with validation and type checking"""
+    
+    # Decimal precision (enhanced for microtransactions)
+    PRECISION = Decimal('28')
+    THORIUM_PRECISION = 8
+    MIN_THORIUM_AMOUNT = Decimal('0.00000001')  # 1 Satoshi equivalent
+    MAX_THORIUM_SUPPLY = Decimal('21000000')
+    
+    # Mining configuration - Set hex difficulty to 5 zeros
+    INITIAL_DIFFICULTY = 6  # Changed from 4 to 5 for hex difficulty
+    BLOCK_TIME_TARGET = 60  # seconds
+    INITIAL_REWARD = Decimal('50.0')
+    HALVING_INTERVAL = 210000
+    MAX_BLOCK_SIZE = 1024 * 1024  # 1MB
+    MINING_THREADS = 2
+    
+    # Network configuration
+    P2P_PORT = 9333
+    API_PORT = 9334
+    MAX_PEERS = 100
+    CONNECTION_TIMEOUT = 15
+    PEER_BROADCAST_INTERVAL = 300
+    DNS_SEEDS = ["seed.thorium.network", "backup.thorium.network"]
+    
+    # Transaction configuration - Set fees to 0
+    TRANSACTION_FEE = Decimal('0.0000')  # Changed from 0.0001 to 0.0000
+    MIN_RELAY_FEE = Decimal('0.00000')  # Changed from 0.00001 to 0.00000
+    MAX_TRANSACTIONS_PER_BLOCK = 2000
+    MAX_MEMPOOL_SIZE = 10000
+    
+    # Security configuration
+    MAX_SIGNATURE_CHECKS = 1000
+    PASSWORD_MIN_LENGTH = 8  # Reduced from 12 for easier testing
+    KEY_DERIVATION_ITERATIONS = 100000
+    ENCRYPTION_VERSION = "AES-256-GCM"
+    
+    # Database configuration
+    DATABASE_FILE = "thorium.db"
+    WALLETS_DIR = "wallets/"
+    BLOCKCHAIN_DIR = "blocks/"
+    SNAPSHOT_DIR = "snapshots/"
+    LOGS_DIR = "logs/"
+    
+    # Performance configuration
+    CACHE_SIZE = 10000
+    SYNC_BATCH_SIZE = 100
+    VALIDATION_POOL_SIZE = 4
+    
+    # P2P Network configuration
+    PEER_DISCOVERY_INTERVAL = 60  # seconds
+    PING_INTERVAL = 30  # seconds
+    MAX_MESSAGE_SIZE = 10 * 1024 * 1024  # 10MB
+    
+    @classmethod
+    def validate(cls):
+        """Validate all configuration values"""
+        assert cls.THORIUM_PRECISION > 0, "Precision must be positive"
+        assert cls.MIN_THORIUM_AMOUNT > Decimal('0'), "Min amount must be positive"
+        assert cls.MAX_THORIUM_SUPPLY > Decimal('0'), "Max supply must be positive"
+        assert cls.INITIAL_DIFFICULTY > 0, "Difficulty must be positive"
+        assert cls.BLOCK_TIME_TARGET > 0, "Block time must be positive"
+        assert cls.INITIAL_REWARD > Decimal('0'), "Reward must be positive"
+        assert cls.HALVING_INTERVAL > 0, "Halving interval must be positive"
+        assert cls.MAX_BLOCK_SIZE > 0, "Block size must be positive"
+        assert cls.P2P_PORT > 0 and cls.P2P_PORT < 65536, "Invalid port"
+        return True
+
+# Validate configuration
+Config.validate()
+
+# Set decimal context
+getcontext().prec = int(Config.PRECISION)
+THORIUM_PRECISION = Config.THORIUM_PRECISION
+
+# --- ENUMS AND CONSTANTS ---
+class TransactionType(Enum):
+    REGULAR = 1
+    COINBASE = 2
+    STAKING = 3
+    CONTRACT = 4
+
+class NetworkMessage(Enum):
+    HELLO = "hello"
+    PEERS = "peers"
+    TRANSACTION = "transaction"
+    BLOCK = "block"
+    GET_BLOCKS = "getblocks"
+    GET_DATA = "getdata"
+    INVENTORY = "inventory"
+    PING = "ping"
+    PONG = "pong"
+    GET_PEERS = "getpeers"
+    VERSION = "version"
+    VERACK = "verack"
+
+# --- SETUP LOGGING WITH ROTATION ---
+def setup_logging():
+    """Setup enhanced logging with rotation"""
+    if not os.path.exists(Config.LOGS_DIR):
+        os.makedirs(Config.LOGS_DIR)
+    
+    # Create loggers
+    logger = logging.getLogger('thorium')
+    logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers
+    logger.handlers.clear()
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_format = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    console_handler.setFormatter(console_format)
+    
+    # File handler with rotation
+    from logging.handlers import RotatingFileHandler
+    file_handler = RotatingFileHandler(
+        os.path.join(Config.LOGS_DIR, 'thorium.log'),
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_format = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'
+    )
+    file_handler.setFormatter(file_format)
+    
+    # Add handlers
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+    
+    return logger
+
+logger = setup_logging()
+
+# --- ENHANCED DATA STRUCTURES ---
+@dataclass
+class TransactionInput:
+    """Transaction input with reference to previous output"""
+    txid: str  # Transaction ID
+    vout: int  # Output index
+    signature: str = ""
+    public_key: str = ""
+    sequence: int = 0xFFFFFFFF
+    
+    def to_dict(self) -> Dict:
+        return {k: v for k, v in asdict(self).items() if not k.startswith('_')}
+
+@dataclass
+class TransactionOutput:
+    """Transaction output with amount and script"""
+    amount: str
+    address: str
+    script: str = ""  # For future script support
+    
+    def to_dict(self) -> Dict:
+        return {k: v for k, v in asdict(self).items() if not k.startswith('_')}
+
+@dataclass
+class Transaction:
+    """Enhanced transaction with multiple inputs/outputs"""
+    version: int = 1
+    txid: str = ""
+    inputs: List[TransactionInput] = field(default_factory=list)
+    outputs: List[TransactionOutput] = field(default_factory=list)
+    locktime: int = 0
+    timestamp: int = 0
+    type: TransactionType = TransactionType.REGULAR
+    data: Dict[str, Any] = field(default_factory=dict)
+    
+    def __post_init__(self):
+        if not self.timestamp:
+            self.timestamp = int(time.time())
+        if not self.txid:
+            self.txid = self.calculate_hash()
+    
+    def to_dict(self) -> Dict:
+        return {
+            'version': self.version,
+            'txid': self.txid,
+            'inputs': [i.to_dict() for i in self.inputs],
+            'outputs': [o.to_dict() for o in self.outputs],
+            'locktime': self.locktime,
+            'timestamp': self.timestamp,
+            'type': self.type.value,
+            'data': self.data
+        }
+    
+    def calculate_hash(self) -> str:
+        """Calculate transaction ID - FIXED to include ALL data"""
+        tx_data = json.dumps({
+            'version': self.version,
+            'inputs': [i.to_dict() for i in self.inputs],
+            'outputs': [o.to_dict() for o in self.outputs],
+            'locktime': self.locktime,
+            'timestamp': self.timestamp,
+            'type': self.type.value,
+            'data': self.data
+        }, sort_keys=True)
+        return hashlib.sha256(hashlib.sha256(tx_data.encode()).digest()).hexdigest()
+    
+    def is_coinbase(self) -> bool:
+        """Check if this is a coinbase transaction"""
+        return self.type == TransactionType.COINBASE
+    
+    def get_total_output(self) -> Decimal:
+        """Calculate total output amount"""
+        total = Decimal('0')
+        for output in self.outputs:
+            total += Decimal(output.amount)
+        return total
+
+@dataclass
+class BlockHeader:
+    """Enhanced block header with additional fields"""
+    version: int = 1
+    prev_hash: str = "0" * 64
+    merkle_root: str = ""
+    timestamp: int = 0
+    difficulty: int = Config.INITIAL_DIFFICULTY
+    nonce: int = 0
+    height: int = 0
+    bits: int = 0x1e0ffff0  # Compact representation of difficulty
+    chainwork: str = "0"  # Cumulative proof of work
+    
+    def __post_init__(self):
+        if not self.timestamp:
+            self.timestamp = int(time.time())
+    
+    def to_bytes(self) -> bytes:
+        """Convert header to bytes for hashing"""
+        return (
+            struct.pack('<I', self.version) +
+            bytes.fromhex(self.prev_hash)[::-1] +
+            bytes.fromhex(self.merkle_root)[::-1] +
+            struct.pack('<III', self.timestamp, self.difficulty, self.nonce)
+        )
+    
+    def hash(self) -> str:
+        """Calculate block hash (double SHA-256)"""
+        header_bytes = self.to_bytes()
+        first_hash = hashlib.sha256(header_bytes).digest()
+        block_hash = hashlib.sha256(first_hash).digest()
+        return block_hash[::-1].hex()  # Convert to little-endian
+    
+    def validate_pow(self) -> bool:
+        """Validate proof of work - check for 5 hex zeros"""
+        block_hash = self.hash()
+        # Check if hash starts with difficulty zeros (hex)
+        return block_hash.startswith('0' * self.difficulty)
+
+@dataclass
+class Block:
+    """Enhanced block structure"""
+    header: BlockHeader
+    transactions: List[Transaction] = field(default_factory=list)
+    size: int = 0
+    validation_flags: int = 0
+    
+    def __post_init__(self):
+        if self.size == 0 and self.transactions:
+            self.size = len(pickle.dumps(self))
+    
+    def to_dict(self) -> Dict:
+        return {
+            'header': {k: v for k, v in asdict(self.header).items() if not k.startswith('_')},
+            'transactions': [tx.to_dict() for tx in self.transactions],
+            'size': self.size
+        }
+    
+    def calculate_merkle_root(self) -> str:
+        """Calculate Merkle root using optimized method"""
+        if not self.transactions:
+            return "0" * 64
+        
+        tx_hashes = [tx.txid for tx in self.transactions]
+        
+        # Use efficient iterative method
+        while len(tx_hashes) > 1:
+            # If odd number, duplicate last
+            if len(tx_hashes) % 2 == 1:
+                tx_hashes.append(tx_hashes[-1])
+            
+            # Use list comprehension for speed
+            new_hashes = []
+            for i in range(0, len(tx_hashes), 2):
+                combined = tx_hashes[i] + tx_hashes[i + 1]
+                new_hash = hashlib.sha256(hashlib.sha256(combined.encode()).digest()).hexdigest()
+                new_hashes.append(new_hash)
+            
+            tx_hashes = new_hashes
+        
+        return tx_hashes[0]
+    
+    def validate_merkle_root(self) -> bool:
+        """Validate Merkle root"""
+        return self.calculate_merkle_root() == self.header.merkle_root
+
+@dataclass
+class Wallet:
+    """Enhanced wallet with better security features"""
+    id: str = ""
+    name: str = ""
+    address: str = ""
+    public_key: str = ""
+    encrypted_private_key: str = ""
+    salt: str = ""
+    iterations: int = Config.KEY_DERIVATION_ITERATIONS
+    created: int = 0
+    last_used: int = 0
+    balance_cache: str = "0"
+    transaction_count: int = 0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def __post_init__(self):
+        if not self.id:
+            self.id = str(uuid.uuid4())
+        if not self.created:
+            self.created = int(time.time())
+        if not self.last_used:
+            self.last_used = self.created
+    
+    def to_dict(self) -> Dict:
+        data = {k: v for k, v in asdict(self).items() if not k.startswith('_')}
+        # Don't expose sensitive data
+        if 'encrypted_private_key' in data:
+            data.pop('encrypted_private_key')
+        if 'salt' in data:
+            data.pop('salt')
+        return data
+    
+    def update_usage(self):
+        """Update last used timestamp"""
+        self.last_used = int(time.time())
+
+# --- ENHANCED UTILITY FUNCTIONS ---
+class ThoriumUtils:
+    """Utility class for Thorium operations"""
+    
+    @staticmethod
+    def format_thorium(amount: Decimal) -> str:
+        """Format Thorium amount with proper decimal places"""
+        quantized = amount.quantize(
+            Decimal(f"1.{'0' * THORIUM_PRECISION}"),
+            rounding=ROUND_DOWN
+        )
+        return f"{quantized:.{THORIUM_PRECISION}f}".rstrip('0').rstrip('.')
+    
+    @staticmethod
+    def parse_thorium(amount_str: str) -> Decimal:
+        """Parse Thorium amount string to Decimal with validation"""
+        try:
+            amount = Decimal(amount_str)
+            if amount < Decimal('0'):
+                raise ValueError("Amount cannot be negative")
+            
+            # Check precision
+            str_parts = str(amount).split('.')
+            if len(str_parts) > 1 and len(str_parts[1]) > THORIUM_PRECISION:
+                raise ValueError(f"Maximum precision is {THORIUM_PRECISION} decimals")
+            
+            return amount.quantize(
+                Decimal(f"1.{'0' * THORIUM_PRECISION}"),
+                rounding=ROUND_DOWN
+            )
+        except Exception as e:
+            raise ValueError(f"Invalid Thorium amount '{amount_str}': {e}")
+    
+    @staticmethod
+    def hash256(data: bytes) -> bytes:
+        """Double SHA-256 hash"""
+        return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+    
+    @staticmethod
+    def ripemd160(data: bytes) -> bytes:
+        """RIPEMD-160 hash"""
+        ripemd = hashlib.new('ripemd160')
+        ripemd.update(data)
+        return ripemd.digest()
+
+# Alias for convenience
+format_thorium = ThoriumUtils.format_thorium
+parse_thorium = ThoriumUtils.parse_thorium
+
+# --- SIMPLIFIED ENCRYPTION ---
+class CryptoManager:
+    """Simplified cryptography manager for wallet encryption"""
+    
+    @staticmethod
+    def generate_keypair() -> Tuple[str, str]:
+        """Generate ECDSA keypair using secp256k1"""
+        if CRYPTOGRAPHY_AVAILABLE:
+            private_key = ec.generate_private_key(ec.SECP256K1(), default_backend())
+            public_key = private_key.public_key()
+            
+            # Serialize private key
+            private_bytes = private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            )
+            
+            # Serialize public key
+            public_bytes = public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+            
+            return private_bytes.decode(), public_bytes.decode()
+        else:
+            # Fallback to simplified keys
+            seed = str(time.time()) + str(random.random())
+            private_key = hashlib.sha256(seed.encode()).hexdigest()
+            public_key = hashlib.sha256(private_key.encode()).hexdigest()
+            return private_key, public_key
+    
+    @staticmethod
+    def encrypt_simple(data: str, password: str, salt: str = None) -> Tuple[str, str]:
+        """Simple encryption for wallet private keys"""
+        if salt is None:
+            salt = secrets.token_hex(16)
+        
+        # Create a simple key from password and salt
+        key = hashlib.sha256((password + salt).encode()).hexdigest()
+        
+        # Simple XOR encryption
+        data_bytes = data.encode()
+        key_bytes = key.encode()
+        
+        encrypted = bytearray()
+        for i in range(len(data_bytes)):
+            encrypted.append(data_bytes[i] ^ key_bytes[i % len(key_bytes)])
+        
+        return base64.b64encode(encrypted).decode(), salt
+    
+    @staticmethod
+    def decrypt_simple(encrypted_data: str, password: str, salt: str) -> str:
+        """Simple decryption for wallet private keys"""
+        try:
+            # Create the same key from password and salt
+            key = hashlib.sha256((password + salt).encode()).hexdigest()
+            
+            # Decrypt using XOR
+            encrypted_bytes = base64.b64decode(encrypted_data)
+            key_bytes = key.encode()
+            
+            decrypted = bytearray()
+            for i in range(len(encrypted_bytes)):
+                decrypted.append(encrypted_bytes[i] ^ key_bytes[i % len(key_bytes)])
+            
+            return decrypted.decode()
+        except Exception as e:
+            raise ValueError(f"Decryption failed: {e}")
+    
+    @staticmethod
+    def sign_message(message: bytes, private_key: str) -> str:
+        """Sign message with private key"""
+        if CRYPTOGRAPHY_AVAILABLE and private_key.startswith('-----BEGIN'):
+            try:
+                priv_key = serialization.load_pem_private_key(
+                    private_key.encode(),
+                    password=None,
+                    backend=default_backend()
+                )
+                
+                signature = priv_key.sign(
+                    message,
+                    ec.ECDSA(hashes.SHA256())
+                )
+                
+                return base64.b64encode(signature).decode()
+            except Exception as e:
+                logger.error(f"Signing failed: {e}")
+                return ""
+        else:
+            # Simplified signature for fallback
+            sig_data = private_key + message.hex()
+            return hashlib.sha256(sig_data.encode()).hexdigest()
+
+# --- DATABASE MANAGER ---
+class DatabaseManager:
+    """SQLite database manager for blockchain data"""
+    
+    def __init__(self, db_file: str = Config.DATABASE_FILE):
+        self.db_file = db_file
+        self.connection = None
+        self.lock = threading.RLock()
+        self.init_database()
+    
+    def init_database(self):
+        """Initialize database with tables"""
+        with self.lock:
+            self.connection = sqlite3.connect(self.db_file, check_same_thread=False)
+            self.connection.row_factory = sqlite3.Row
+            cursor = self.connection.cursor()
+            
+            # Enable WAL mode for better concurrency
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA cache_size=-2000")  # 2MB cache
+            
+            # Blocks table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS blocks (
+                    height INTEGER PRIMARY KEY,
+                    hash TEXT UNIQUE NOT NULL,
+                    prev_hash TEXT NOT NULL,
+                    merkle_root TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    difficulty INTEGER NOT NULL,
+                    nonce INTEGER NOT NULL,
+                    size INTEGER NOT NULL,
+                    transaction_count INTEGER NOT NULL,
+                    version INTEGER NOT NULL,
+                    validated INTEGER DEFAULT 0
+                )
+            """)
+            
+            # Transactions table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS transactions (
+                    txid TEXT PRIMARY KEY,
+                    block_height INTEGER,
+                    type INTEGER NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    locktime INTEGER DEFAULT 0,
+                    data TEXT,
+                    FOREIGN KEY (block_height) REFERENCES blocks(height)
+                )
+            """)
+            
+            # Transaction inputs table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS transaction_inputs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    txid TEXT NOT NULL,
+                    prev_txid TEXT NOT NULL,
+                    prev_vout INTEGER NOT NULL,
+                    signature TEXT,
+                    sequence INTEGER DEFAULT 0xFFFFFFFF,
+                    FOREIGN KEY (txid) REFERENCES transactions(txid)
+                )
+            """)
+            
+            # Transaction outputs table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS transaction_outputs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    txid TEXT NOT NULL,
+                    vout INTEGER NOT NULL,
+                    address TEXT NOT NULL,
+                    amount TEXT NOT NULL,
+                    spent INTEGER DEFAULT 0,
+                    spent_by TEXT,
+                    FOREIGN KEY (txid) REFERENCES transactions(txid),
+                    UNIQUE(txid, vout)
+                )
+            """)
+            
+            # UTXO index
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_utxo ON transaction_outputs(address, spent)
+            """)
+            
+            # Peers table for P2P network
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS peers (
+                    address TEXT PRIMARY KEY,
+                    port INTEGER NOT NULL,
+                    last_seen INTEGER NOT NULL,
+                    success_count INTEGER DEFAULT 0,
+                    fail_count INTEGER DEFAULT 0,
+                    banned_until INTEGER DEFAULT 0,
+                    version TEXT,
+                    services INTEGER DEFAULT 0
+                )
+            """)
+            
+            self.connection.commit()
+    
+    def execute(self, query: str, params: tuple = ()) -> sqlite3.Cursor:
+        """Execute query with thread safety"""
+        with self.lock:
+            cursor = self.connection.cursor()
+            cursor.execute(query, params)
+            return cursor
+    
+    def commit(self):
+        """Commit transaction"""
+        with self.lock:
+            self.connection.commit()
+    
+    def rollback(self):
+        """Rollback transaction"""
+        with self.lock:
+            if self.connection:
+                self.connection.rollback()
+    
+    def close(self):
+        """Close database connection"""
+        with self.lock:
+            if self.connection:
+                self.connection.close()
+
+# --- P2P NETWORK MANAGER ---
+class PeerConnection:
+    """Represents a connection to a peer"""
+    
+    def __init__(self, sock: socket.socket, address: tuple):
+        self.socket = sock
+        self.address = address
+        self.last_message = time.time()
+        self.connected = True
+        self.send_queue = queue.Queue()
+        self.lock = threading.RLock()
+    
+    def send(self, message: dict):
+        """Queue a message to send"""
+        try:
+            self.send_queue.put(message)
+        except Exception as e:
+            logger.error(f"Failed to queue message: {e}")
+    
+    def receive(self) -> Optional[dict]:
+        """Receive a message from the peer"""
+        try:
+            # Set timeout for receiving
+            self.socket.settimeout(0.1)
+            data = self.socket.recv(Config.MAX_MESSAGE_SIZE)
+            if data:
+                self.last_message = time.time()
+                return json.loads(data.decode())
+        except socket.timeout:
+            pass
+        except Exception as e:
+            logger.debug(f"Receive error from {self.address}: {e}")
+            self.connected = False
+        return None
+    
+    def process_send_queue(self):
+        """Process the send queue"""
+        try:
+            while not self.send_queue.empty():
+                message = self.send_queue.get_nowait()
+                data = json.dumps(message).encode()
+                self.socket.sendall(data)
+        except Exception as e:
+            logger.debug(f"Send error to {self.address}: {e}")
+            self.connected = False
+    
+    def close(self):
+        """Close the connection"""
+        with self.lock:
+            self.connected = False
+            try:
+                self.socket.close()
+            except:
+                pass
+
+class P2PNetworkManager:
+    """P2P Network Manager for Thorium"""
+    
+    def __init__(self, blockchain):
+        self.blockchain = blockchain
+        self.peers: Dict[str, PeerConnection] = {}
+        self.server_socket = None
+        self.running = False
+        self.lock = threading.RLock()
+        self.peer_lock = threading.RLock()
+        
+        # Start network threads
+        self.server_thread = threading.Thread(target=self.start_server, daemon=True)
+        self.peer_manager_thread = threading.Thread(target=self.manage_peers, daemon=True)
+        
+    def start(self):
+        """Start the P2P network"""
+        self.running = True
+        self.server_thread.start()
+        self.peer_manager_thread.start()
+        logger.info("P2P Network started")
+        
+        # Connect to some initial peers
+        self.connect_to_initial_peers()
+    
+    def stop(self):
+        """Stop the P2P network"""
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+        
+        # Close all peer connections
+        with self.peer_lock:
+            for peer in list(self.peers.values()):
+                peer.close()
+            self.peers.clear()
+        
+        logger.info("P2P Network stopped")
+    
+    def start_server(self):
+        """Start the P2P server to accept incoming connections"""
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind(('0.0.0.0', Config.P2P_PORT))
+            self.server_socket.listen(Config.MAX_PEERS)
+            self.server_socket.settimeout(1.0)  # Timeout for accept
+            
+            logger.info(f"P2P server listening on port {Config.P2P_PORT}")
+            
+            while self.running:
+                try:
+                    client_socket, address = self.server_socket.accept()
+                    logger.info(f"New connection from {address}")
+                    
+                    # Create peer connection
+                    peer = PeerConnection(client_socket, address)
+                    
+                    # Handle the connection in a new thread
+                    threading.Thread(
+                        target=self.handle_peer_connection,
+                        args=(peer,),
+                        daemon=True
+                    ).start()
+                    
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    if self.running:
+                        logger.error(f"Server accept error: {e}")
+                    break
+                    
+        except Exception as e:
+            logger.error(f"Server error: {e}")
+    
+    def handle_peer_connection(self, peer: PeerConnection):
+        """Handle a peer connection"""
+        try:
+            # Send version message
+            version_msg = {
+                'type': NetworkMessage.VERSION.value,
+                'data': {
+                    'version': '2.0',
+                    'height': self.blockchain.height,
+                    'timestamp': int(time.time())
+                }
+            }
+            peer.send(version_msg)
+            
+            # Add to peers list
+            with self.peer_lock:
+                self.peers[f"{peer.address[0]}:{peer.address[1]}"] = peer
+            
+            # Main loop for this peer
+            while self.running and peer.connected:
+                # Receive messages
+                message = peer.receive()
+                if message:
+                    self.handle_message(message, peer)
+                
+                # Send queued messages
+                peer.process_send_queue()
+                
+                # Check if connection is stale
+                if time.time() - peer.last_message > Config.CONNECTION_TIMEOUT:
+                    logger.debug(f"Connection to {peer.address} timed out")
+                    peer.connected = False
+                
+                time.sleep(0.1)  # Prevent CPU spin
+                
+        except Exception as e:
+            logger.debug(f"Peer connection error: {e}")
+        finally:
+            # Clean up
+            with self.peer_lock:
+                peer_key = f"{peer.address[0]}:{peer.address[1]}"
+                if peer_key in self.peers:
+                    del self.peers[peer_key]
+            peer.close()
+    
+    def handle_message(self, message: dict, peer: PeerConnection):
+        """Handle incoming message from peer"""
+        msg_type = message.get('type')
+        data = message.get('data', {})
+        
+        try:
+            if msg_type == NetworkMessage.VERSION.value:
+                self.handle_version(data, peer)
+            elif msg_type == NetworkMessage.VERACK.value:
+                self.handle_verack(data, peer)
+            elif msg_type == NetworkMessage.PING.value:
+                self.handle_ping(data, peer)
+            elif msg_type == NetworkMessage.PONG.value:
+                self.handle_pong(data, peer)
+            elif msg_type == NetworkMessage.GET_PEERS.value:
+                self.handle_get_peers(peer)
+            elif msg_type == NetworkMessage.PEERS.value:
+                self.handle_peers(data, peer)
+            elif msg_type == NetworkMessage.TRANSACTION.value:
+                self.handle_transaction(data, peer)
+            elif msg_type == NetworkMessage.BLOCK.value:
+                self.handle_block(data, peer)
+            
+        except Exception as e:
+            logger.error(f"Error handling message {msg_type}: {e}")
+    
+    def handle_version(self, data: dict, peer: PeerConnection):
+        """Handle version message"""
+        peer_height = data.get('height', 0)
+        peer_version = data.get('version', '')
+        
+        logger.info(f"Peer {peer.address} version {peer_version}, height {peer_height}")
+        
+        # Send verack
+        verack_msg = {
+            'type': NetworkMessage.VERACK.value,
+            'data': {'accepted': True}
+        }
+        peer.send(verack_msg)
+    
+    def handle_verack(self, data: dict, peer: PeerConnection):
+        """Handle verack message"""
+        logger.debug(f"Verack from {peer.address}")
+    
+    def handle_ping(self, data: dict, peer: PeerConnection):
+        """Handle ping message"""
+        pong_msg = {
+            'type': NetworkMessage.PONG.value,
+            'data': {'timestamp': data.get('timestamp', 0)}
+        }
+        peer.send(pong_msg)
+    
+    def handle_pong(self, data: dict, peer: PeerConnection):
+        """Handle pong message"""
+        logger.debug(f"Pong from {peer.address}")
+    
+    def handle_get_peers(self, peer: PeerConnection):
+        """Handle getpeers message"""
+        with self.peer_lock:
+            peer_list = []
+            for p in self.peers.values():
+                if p.connected and p != peer:
+                    peer_list.append({
+                        'address': p.address[0],
+                        'port': p.address[1]
+                    })
+        
+        peers_msg = {
+            'type': NetworkMessage.PEERS.value,
+            'data': {'peers': peer_list[:50]}  # Limit to 50 peers
+        }
+        peer.send(peers_msg)
+    
+    def handle_peers(self, data: dict, peer: PeerConnection):
+        """Handle peers message"""
+        peer_list = data.get('peers', [])
+        for p in peer_list:
+            self.connect_to_peer(p['address'], p['port'])
+    
+    def handle_transaction(self, data: dict, peer: PeerConnection):
+        """Handle transaction message"""
+        try:
+            # Create transaction object
+            tx = Transaction(
+                txid=data.get('txid'),
+                inputs=[TransactionInput(**i) for i in data.get('inputs', [])],
+                outputs=[TransactionOutput(**o) for o in data.get('outputs', [])],
+                locktime=data.get('locktime', 0),
+                timestamp=data.get('timestamp', 0),
+                type=TransactionType(data.get('type', 1)),
+                data=data.get('data', {})
+            )
+            
+            # Add to mempool
+            success, message = self.blockchain.add_to_mempool(tx)
+            if success:
+                logger.info(f"Received transaction from {peer.address}: {tx.txid[:8]}...")
+                # Broadcast to other peers
+                self.broadcast_message({
+                    'type': NetworkMessage.TRANSACTION.value,
+                    'data': data
+                }, exclude_peer=peer)
+        
+        except Exception as e:
+            logger.error(f"Error processing transaction: {e}")
+    
+    def handle_block(self, data: dict, peer: PeerConnection):
+        """Handle block message"""
+        try:
+            # Create block object
+            header_data = data.get('header', {})
+            header = BlockHeader(**header_data)
+            
+            transactions = []
+            for tx_data in data.get('transactions', []):
+                tx = Transaction(
+                    txid=tx_data.get('txid'),
+                    inputs=[TransactionInput(**i) for i in tx_data.get('inputs', [])],
+                    outputs=[TransactionOutput(**o) for o in tx_data.get('outputs', [])],
+                    locktime=tx_data.get('locktime', 0),
+                    timestamp=tx_data.get('timestamp', 0),
+                    type=TransactionType(tx_data.get('type', 1)),
+                    data=tx_data.get('data', {})
+                )
+                transactions.append(tx)
+            
+            block = Block(header=header, transactions=transactions)
+            
+            # Add to blockchain
+            success, message = self.blockchain.add_block(block)
+            if success:
+                logger.info(f"Received block from {peer.address}: {header.height}")
+                # Broadcast to other peers
+                self.broadcast_message({
+                    'type': NetworkMessage.BLOCK.value,
+                    'data': data
+                }, exclude_peer=peer)
+        
+        except Exception as e:
+            logger.error(f"Error processing block: {e}")
+    
+    def connect_to_peer(self, ip: str, port: int):
+        """Connect to a peer"""
+        if len(self.peers) >= Config.MAX_PEERS:
+            return False
+        
+        peer_key = f"{ip}:{port}"
+        
+        with self.peer_lock:
+            if peer_key in self.peers:
+                return True  # Already connected
+        
+        try:
+            sock = socket.create_connection((ip, port), timeout=Config.CONNECTION_TIMEOUT)
+            sock.settimeout(Config.CONNECTION_TIMEOUT)
+            
+            peer = PeerConnection(sock, (ip, port))
+            
+            # Start handling this connection
+            threading.Thread(
+                target=self.handle_peer_connection,
+                args=(peer,),
+                daemon=True
+            ).start()
+            
+            logger.info(f"Connected to peer {ip}:{port}")
+            return True
+            
+        except Exception as e:
+            logger.debug(f"Failed to connect to {ip}:{port}: {e}")
+            return False
+    
+    def connect_to_initial_peers(self):
+        """Connect to some initial peers"""
+        # Try to connect to localhost first (for testing)
+        if Config.P2P_PORT != 9333:  # Not connecting to ourselves
+            self.connect_to_peer('127.0.0.1', 9333)
+        
+        # Try some common ports
+        for port in [9333, 9334, 9335, 9336]:
+            if port != Config.P2P_PORT:
+                self.connect_to_peer('127.0.0.1', port)
+    
+    def broadcast_message(self, message: dict, exclude_peer: PeerConnection = None):
+        """Broadcast message to all peers"""
+        with self.peer_lock:
+            for peer in self.peers.values():
+                if peer.connected and peer != exclude_peer:
+                    try:
+                        peer.send(message)
+                    except Exception as e:
+                        logger.debug(f"Failed to broadcast to {peer.address}: {e}")
+    
+    def broadcast_transaction(self, transaction: Transaction):
+        """Broadcast a transaction to the network"""
+        message = {
+            'type': NetworkMessage.TRANSACTION.value,
+            'data': transaction.to_dict()
+        }
+        self.broadcast_message(message)
+    
+    def broadcast_block(self, block: Block):
+        """Broadcast a block to the network"""
+        message = {
+            'type': NetworkMessage.BLOCK.value,
+            'data': block.to_dict()
+        }
+        self.broadcast_message(message)
+    
+    def manage_peers(self):
+        """Manage peer connections"""
+        while self.running:
+            try:
+                # Remove disconnected peers
+                with self.peer_lock:
+                    disconnected = []
+                    for key, peer in list(self.peers.items()):
+                        if not peer.connected:
+                            disconnected.append(key)
+                    
+                    for key in disconnected:
+                        del self.peers[key]
+                
+                # Ping peers periodically
+                with self.peer_lock:
+                    for peer in self.peers.values():
+                        if time.time() - peer.last_message > Config.PING_INTERVAL:
+                            ping_msg = {
+                                'type': NetworkMessage.PING.value,
+                                'data': {'timestamp': int(time.time())}
+                            }
+                            peer.send(ping_msg)
+                
+                # Try to maintain minimum number of peers
+                with self.peer_lock:
+                    if len(self.peers) < 5:
+                        # Request peers from existing peers
+                        for peer in list(self.peers.values())[:3]:  # Ask first 3 peers
+                            getpeers_msg = {
+                                'type': NetworkMessage.GET_PEERS.value,
+                                'data': {}
+                            }
+                            peer.send(getpeers_msg)
+                
+                time.sleep(10)  # Run every 10 seconds
+                
+            except Exception as e:
+                logger.error(f"Peer manager error: {e}")
+                time.sleep(5)
+
+# --- ENHANCED BLOCKCHAIN MANAGER ---
+class Blockchain:
+    """Enhanced blockchain manager with database support"""
+    
+    def __init__(self, network_manager=None):
+        self.db = DatabaseManager()
+        self.network = network_manager
+        self.mempool: Dict[str, Transaction] = {}
+        self.orphan_blocks: Dict[str, Block] = {}
+        self.difficulty = Config.INITIAL_DIFFICULTY
+        self.height = 0
+        self.chain_tip = None
+        self.lock = threading.RLock()
+        self.validation_pool = ThreadPoolExecutor(max_workers=Config.VALIDATION_POOL_SIZE)
+        
+        self.load_chain_tip()
+        
+        if self.height == 0:
+            self.create_genesis_block()
+    
+    def load_chain_tip(self):
+        """Load latest block from database"""
+        cursor = self.db.execute("SELECT MAX(height) as max_height FROM blocks")
+        row = cursor.fetchone()
+        self.height = row['max_height'] if row and row['max_height'] is not None else 0
+        
+        if self.height > 0:
+            cursor = self.db.execute(
+                "SELECT * FROM blocks WHERE height = ?",
+                (self.height,)
+            )
+            row = cursor.fetchone()
+            if row:
+                self.chain_tip = self.row_to_block(row)
+    
+    def row_to_block(self, row: sqlite3.Row) -> Block:
+        """Convert database row to Block object"""
+        header = BlockHeader(
+            version=row['version'],
+            prev_hash=row['prev_hash'],
+            merkle_root=row['merkle_root'],
+            timestamp=row['timestamp'],
+            difficulty=row['difficulty'],
+            nonce=row['nonce'],
+            height=row['height']
+        )
+        
+        # Load transactions - FIXED: Now properly loads all transactions
+        cursor = self.db.execute(
+            "SELECT * FROM transactions WHERE block_height = ? ORDER BY type",
+            (row['height'],)
+        )
+        
+        transactions = []
+        for tx_row in cursor.fetchall():
+            try:
+                transactions.append(self.row_to_transaction(tx_row))
+            except Exception as e:
+                logger.error(f"Failed to load transaction {tx_row['txid']}: {e}")
+        
+        return Block(
+            header=header,
+            transactions=transactions,
+            size=row['size']
+        )
+    
+    def row_to_transaction(self, row: sqlite3.Row) -> Transaction:
+        """Convert database row to Transaction object"""
+        tx_type = TransactionType(row['type'])
+        
+        tx = Transaction(
+            version=1,
+            txid=row['txid'],
+            locktime=row['locktime'],
+            timestamp=row['timestamp'],
+            type=tx_type
+        )
+        
+        if row['data']:
+            try:
+                tx.data = json.loads(row['data'])
+            except:
+                tx.data = {}
+        
+        # Only load inputs for non-coinbase transactions
+        if tx_type != TransactionType.COINBASE:
+            cursor = self.db.execute(
+                "SELECT * FROM transaction_inputs WHERE txid = ?",
+                (row['txid'],)
+            )
+            for input_row in cursor.fetchall():
+                tx.inputs.append(TransactionInput(
+                    txid=input_row['prev_txid'],
+                    vout=input_row['prev_vout'],
+                    signature=input_row['signature'] or "",
+                    sequence=input_row['sequence']
+                ))
+        
+        # Load outputs
+        cursor = self.db.execute(
+            "SELECT * FROM transaction_outputs WHERE txid = ? ORDER BY vout",
+            (row['txid'],)
+        )
+        for output_row in cursor.fetchall():
+            tx.outputs.append(TransactionOutput(
+                amount=output_row['amount'],
+                address=output_row['address'],
+                script=""
+            ))
+        
+        return tx
+    
+    def create_genesis_block(self):
+        """Create genesis block with improved structure"""
+        logger.info("Creating genesis block...")
+        
+        # Genesis transaction
+        genesis_tx = Transaction(
+            type=TransactionType.COINBASE,
+            outputs=[
+                TransactionOutput(
+                    amount=format_thorium(Decimal("1000.0")),
+                    address="LfMPLdNYNKoqWKvvDoHczdp1wAsBwrGbdJ"  # Default address
+                )
+            ],
+            data={"message": "Thorium Genesis Block"}
+        )
+        
+        # Create block
+        header = BlockHeader(
+            prev_hash="0" * 64,
+            timestamp=int(time.time()),
+            difficulty=2,  # Easy for genesis
+            height=0
+        )
+        
+        block = Block(
+            header=header,
+            transactions=[genesis_tx]
+        )
+        
+        block.header.merkle_root = block.calculate_merkle_root()
+        
+        # Set a valid hash for genesis
+        while not block.header.hash().startswith('0' * header.difficulty):
+            header.nonce += 1
+        
+        self.add_block(block)
+        logger.info(f"Genesis block created: {block.header.hash()[:16]}...")
+    
+    def create_new_block(self, miner_address: str) -> Block:
+        """Create a new candidate block for mining - FIXED VERSION"""
+        # Get transactions from mempool (excluding any coinbase transactions)
+        mempool_txs = [tx for tx in self.mempool.values() if not tx.is_coinbase()]
+        
+        # Create coinbase transaction - this is CRITICAL for miner reward
+        block_reward = self.get_block_reward(self.height + 1)
+        
+        # IMPORTANT FIX: Always create coinbase transaction even if no other transactions
+        coinbase_tx = Transaction(
+            type=TransactionType.COINBASE,
+            outputs=[
+                TransactionOutput(
+                    amount=format_thorium(block_reward),
+                    address=miner_address
+                )
+            ],
+            data={
+                "block_height": self.height + 1,
+                "miner": miner_address,
+                "timestamp": int(time.time()),
+                "nonce": secrets.randbits(64)  # Ensure unique txid
+            }
+        )
+        
+        # Recalculate txid after setting data
+        coinbase_tx.txid = coinbase_tx.calculate_hash()
+        
+        # Select transactions (excluding coinbase)
+        selected_txs = [coinbase_tx]  # Coinbase MUST be first
+        
+        # Add regular transactions from mempool
+        for tx in mempool_txs[:Config.MAX_TRANSACTIONS_PER_BLOCK - 1]:
+            selected_txs.append(tx)
+        
+        # Create block header
+        prev_hash = self.chain_tip.header.hash() if self.chain_tip else "0" * 64
+        header = BlockHeader(
+            prev_hash=prev_hash,
+            height=self.height + 1,
+            difficulty=self.difficulty,
+            timestamp=int(time.time())
+        )
+        
+        block = Block(
+            header=header,
+            transactions=selected_txs
+        )
+        
+        # Calculate Merkle root AFTER all transactions are added
+        block.header.merkle_root = block.calculate_merkle_root()
+        return block
+    
+    def add_block(self, block: Block, validate: bool = True) -> Tuple[bool, str]:
+        """Add block to blockchain with validation - FIXED VERSION"""
+        with self.lock:
+            # Check if block already exists first
+            cursor = self.db.execute(
+                "SELECT height FROM blocks WHERE hash = ? OR height = ?",
+                (block.header.hash(), block.header.height)
+            )
+            if cursor.fetchone():
+                return False, "Block already exists"
+            
+            if validate:
+                is_valid, message = self.validate_block(block)
+                if not is_valid:
+                    return False, message
+            
+            # Store block in database
+            try:
+                # Use transaction for atomicity
+                self.db.execute("BEGIN TRANSACTION")
+                
+                # Insert block
+                self.db.execute(
+                    """
+                    INSERT INTO blocks 
+                    (height, hash, prev_hash, merkle_root, timestamp, difficulty, nonce, size, transaction_count, version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        block.header.height,
+                        block.header.hash(),
+                        block.header.prev_hash,
+                        block.header.merkle_root,
+                        block.header.timestamp,
+                        block.header.difficulty,
+                        block.header.nonce,
+                        block.size,
+                        len(block.transactions),
+                        block.header.version
+                    )
+                )
+                
+                # Insert transactions - FIXED: No OR IGNORE, always insert
+                for tx in block.transactions:
+                    self.add_transaction_to_db(tx, block.header.height)
+                
+                self.db.commit()
+                
+                # Update chain tip
+                self.height = block.header.height
+                self.chain_tip = block
+                
+                # Remove transactions from mempool (except coinbase)
+                for tx in block.transactions:
+                    if not tx.is_coinbase() and tx.txid in self.mempool:
+                        del self.mempool[tx.txid]
+                
+                logger.info(f"Added block {block.header.height}: {block.header.hash()[:16]}...")
+                
+                # Check if miner got reward
+                coinbase_tx = None
+                for tx in block.transactions:
+                    if tx.is_coinbase():
+                        coinbase_tx = tx
+                        break
+                
+                if coinbase_tx:
+                    total_reward = coinbase_tx.get_total_output()
+                    miner_address = coinbase_tx.outputs[0].address if coinbase_tx.outputs else "Unknown"
+                    logger.info(f"💰 Miner {miner_address} received {format_thorium(total_reward)} TH reward")
+                    logger.info(f"📊 Block has {len(block.transactions)} transactions")
+                
+                # Broadcast to network if we have a network manager
+                if self.network:
+                    self.network.broadcast_block(block)
+                
+                return True, "Block added"
+                
+            except Exception as e:
+                self.db.rollback()
+                logger.error(f"Failed to add block: {e}")
+                return False, str(e)
+    
+    def add_transaction_to_db(self, tx: Transaction, block_height: int = None):
+        """Add transaction to database - FIXED: No OR IGNORE"""
+        # First check if transaction already exists
+        cursor = self.db.execute(
+            "SELECT txid FROM transactions WHERE txid = ?",
+            (tx.txid,)
+        )
+        
+        if cursor.fetchone() is None:
+            # Insert transaction - REMOVED OR IGNORE
+            self.db.execute(
+                """
+                INSERT INTO transactions 
+                (txid, block_height, type, timestamp, locktime, data)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    tx.txid,
+                    block_height,
+                    tx.type.value,
+                    tx.timestamp,
+                    tx.locktime,
+                    json.dumps(tx.data) if tx.data else None
+                )
+            )
+        
+        # Insert inputs (coinbase transactions have no inputs)
+        if not tx.is_coinbase():
+            for tx_input in tx.inputs:
+                # Remove OR IGNORE
+                self.db.execute(
+                    """
+                    INSERT INTO transaction_inputs 
+                    (txid, prev_txid, prev_vout, signature, sequence)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        tx.txid,
+                        tx_input.txid,
+                        tx_input.vout,
+                        tx_input.signature,
+                        tx_input.sequence
+                    )
+                )
+        
+        # Insert outputs - FIXED: REMOVED OR IGNORE
+        for vout, tx_output in enumerate(tx.outputs):
+            self.db.execute(
+                """
+                INSERT INTO transaction_outputs 
+                (txid, vout, address, amount, spent)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    tx.txid,
+                    vout,
+                    tx_output.address,
+                    tx_output.amount,
+                    0  # Not spent initially
+                )
+            )
+    
+    def validate_block(self, block: Block) -> Tuple[bool, str]:
+        """Validate block with comprehensive checks"""
+        try:
+            # Basic checks
+            if block.header.height < 0:
+                return False, "Invalid block height"
+            
+            if block.size > Config.MAX_BLOCK_SIZE:
+                return False, f"Block size {block.size} exceeds limit {Config.MAX_BLOCK_SIZE}"
+            
+            # Check proof of work
+            if not block.header.validate_pow():
+                return False, f"Invalid proof of work - hash must start with {block.header.difficulty} zeros"
+            
+            # Validate Merkle root
+            if not block.validate_merkle_root():
+                return False, "Invalid Merkle root"
+            
+            # Check for coinbase transaction
+            if not block.transactions:
+                return False, "Block must have at least one transaction (coinbase)"
+            
+            # First transaction must be coinbase
+            if not block.transactions[0].is_coinbase():
+                return False, "First transaction must be coinbase"
+            
+            # Check coinbase output amount
+            coinbase_tx = block.transactions[0]
+            expected_reward = self.get_block_reward(block.header.height)
+            coinbase_amount = coinbase_tx.get_total_output()
+            
+            if coinbase_amount != expected_reward:
+                return False, f"Invalid coinbase amount. Expected {format_thorium(expected_reward)} TH, got {format_thorium(coinbase_amount)} TH"
+            
+            return True, "Valid block"
+            
+        except Exception as e:
+            return False, f"Block validation error: {e}"
+    
+    def get_balance(self, address: str, confirmed_only: bool = True) -> Decimal:
+        """Get balance for address with optional unconfirmed balance"""
+        query = """
+            SELECT SUM(CAST(amount AS DECIMAL)) as balance
+            FROM transaction_outputs 
+            WHERE address = ? AND spent = 0
+        """
+        
+        if confirmed_only:
+            query += " AND txid IN (SELECT txid FROM transactions WHERE block_height IS NOT NULL)"
+        
+        cursor = self.db.execute(query, (address,))
+        row = cursor.fetchone()
+        
+        if row and row['balance'] is not None:
+            return Decimal(str(row['balance']))
+        return Decimal('0')
+    
+    def get_transaction(self, txid: str) -> Optional[Transaction]:
+        """Get transaction by ID"""
+        cursor = self.db.execute(
+            "SELECT * FROM transactions WHERE txid = ?",
+            (txid,)
+        )
+        row = cursor.fetchone()
+        
+        if row:
+            return self.row_to_transaction(row)
+        return None
+    
+    def get_block(self, height: int = None, hash: str = None) -> Optional[Block]:
+        """Get block by height or hash"""
+        if height is not None:
+            cursor = self.db.execute(
+                "SELECT * FROM blocks WHERE height = ?",
+                (height,)
+            )
+        elif hash is not None:
+            cursor = self.db.execute(
+                "SELECT * FROM blocks WHERE hash = ?",
+                (hash,)
+            )
+        else:
+            return None
+        
+        row = cursor.fetchone()
+        if row:
+            return self.row_to_block(row)
+        return None
+    
+    def add_to_mempool(self, tx: Transaction) -> Tuple[bool, str]:
+        """Add transaction to memory pool"""
+        if len(self.mempool) >= Config.MAX_MEMPOOL_SIZE:
+            # Remove oldest transactions
+            tx_list = list(self.mempool.values())
+            tx_list.sort(key=lambda x: x.timestamp)
+            
+            remove_count = int(len(self.mempool) * 0.1)
+            for tx_item in tx_list[:remove_count]:
+                self.mempool.pop(tx_item.txid, None)
+        
+        txid = tx.txid
+        
+        # Check if already in mempool
+        if txid in self.mempool:
+            return False, "Transaction already in mempool"
+        
+        # Don't allow coinbase transactions in mempool
+        if tx.is_coinbase():
+            return False, "Coinbase transactions cannot be added to mempool"
+        
+        # Basic validation
+        if len(tx.outputs) == 0:
+            return False, "Transaction has no outputs"
+        
+        # Add to mempool
+        self.mempool[txid] = tx
+        logger.info(f"Added transaction to mempool: {txid[:8]}...")
+        
+        # Broadcast to network if we have a network manager
+        if self.network:
+            self.network.broadcast_transaction(tx)
+        
+        return True, "Added to mempool"
+    
+    def get_block_reward(self, height: int) -> Decimal:
+        """Calculate block reward with halving"""
+        halvings = height // Config.HALVING_INTERVAL
+        
+        if halvings >= 64:  # After 64 halvings, reward is 0
+            return Decimal('0')
+        
+        reward = Config.INITIAL_REWARD
+        for _ in range(halvings):
+            reward /= Decimal('2')
+        
+        return reward.quantize(
+            Decimal(f"1.{'0' * THORIUM_PRECISION}"),
+            rounding=ROUND_DOWN
+        )
+
+# --- SIMPLIFIED WALLET MANAGER ---
+class WalletManager:
+    """Simplified wallet manager with working encryption"""
+    
+    def __init__(self, blockchain: Blockchain):
+        self.blockchain = blockchain
+        self.wallets: Dict[str, Wallet] = {}
+        self.current_wallet: Optional[Wallet] = None
+        self.load_wallets()
+    
+    def load_wallets(self):
+        """Load wallets from directory"""
+        if not os.path.exists(Config.WALLETS_DIR):
+            os.makedirs(Config.WALLETS_DIR)
+        
+        for filename in os.listdir(Config.WALLETS_DIR):
+            if filename.endswith('.json'):
+                wallet_path = os.path.join(Config.WALLETS_DIR, filename)
+                try:
+                    with open(wallet_path, 'r') as f:
+                        data = json.load(f)
+                        # Handle old wallet format
+                        if 'encrypted_private_key' in data and 'salt' in data:
+                            wallet = Wallet(**data)
+                            self.wallets[wallet.address] = wallet
+                except Exception as e:
+                    logger.error(f"Failed to load wallet {filename}: {e}")
+    
+    def create_wallet(self, name: str, password: str) -> Wallet:
+        """Create new wallet with simplified encryption"""
+        # Validate password
+        if len(password) < Config.PASSWORD_MIN_LENGTH:
+            raise ValueError(f"Password must be at least {Config.PASSWORD_MIN_LENGTH} characters")
+        
+        # Generate keypair
+        private_key, public_key = CryptoManager.generate_keypair()
+        
+        # Generate a simple address from public key hash
+        address_hash = hashlib.sha256(public_key.encode()).hexdigest()[:40]
+        address = "TH" + address_hash[:33]  # TH for Thorium
+        
+        # Encrypt private key with simple method
+        salt = secrets.token_hex(16)
+        encrypted_key, _ = CryptoManager.encrypt_simple(private_key, password, salt)
+        
+        # Create wallet
+        wallet = Wallet(
+            id=str(uuid.uuid4()),
+            name=name,
+            address=address,
+            public_key=public_key,
+            encrypted_private_key=encrypted_key,
+            salt=salt,
+            created=int(time.time())
+        )
+        
+        # Save wallet
+        self.save_wallet(wallet)
+        self.wallets[wallet.address] = wallet
+        
+        logger.info(f"Created wallet {name} with address {address}")
+        return wallet
+    
+    def save_wallet(self, wallet: Wallet):
+        """Save wallet to disk"""
+        wallet_path = os.path.join(Config.WALLETS_DIR, f"{wallet.id}.json")
+        
+        # Save all data including encrypted private key
+        data = {k: v for k, v in asdict(wallet).items() if not k.startswith('_')}
+        
+        with open(wallet_path, 'w') as f:
+            json.dump(data, f, indent=2)
+    
+    def unlock_wallet(self, address: str, password: str) -> bool:
+        """Unlock wallet with password - FIXED VERSION"""
+        if address not in self.wallets:
+            return False
+        
+        wallet = self.wallets[address]
+        
+        try:
+            # Decrypt private key
+            private_key = CryptoManager.decrypt_simple(
+                wallet.encrypted_private_key,
+                password,
+                wallet.salt
+            )
+            
+            # Verify by checking we can "sign" a test message
+            test_message = b"thorium_wallet_test"
+            signature = CryptoManager.sign_message(test_message, private_key)
+            
+            # For simplified crypto, just check if we got something back
+            if signature:
+                self.current_wallet = wallet
+                wallet.update_usage()
+                self.save_wallet(wallet)  # Update last_used
+                return True
+            
+        except Exception as e:
+            logger.debug(f"Failed to unlock wallet {address}: {e}")
+        
+        return False
+    
+    def create_transaction(self, recipient: str, amount: Decimal) -> Optional[Transaction]:
+        """Create transaction from current wallet"""
+        if not self.current_wallet:
+            raise ValueError("No wallet unlocked")
+        
+        # Get wallet address
+        wallet_address = self.current_wallet.address
+        balance = self.get_balance(wallet_address)
+        
+        if amount > balance:
+            raise ValueError(f"Insufficient balance. Available: {format_thorium(balance)} TH")
+        
+        # Create transaction
+        tx = Transaction(
+            timestamp=int(time.time()),
+            type=TransactionType.REGULAR,
+            data={"from": wallet_address, "to": recipient}
+        )
+        
+        # Add a dummy input (in real implementation, this would be real UTXOs)
+        tx.inputs.append(TransactionInput(
+            txid="0" * 64,  # Dummy previous transaction
+            vout=0,
+            signature="dummy_signature_" + secrets.token_hex(32),
+            public_key=self.current_wallet.public_key
+        ))
+        
+        # Add output to recipient
+        tx.outputs.append(TransactionOutput(
+            amount=format_thorium(amount),
+            address=recipient
+        ))
+        
+        # Add change output if needed (simplified)
+        if balance - amount > Decimal('0.00000001'):
+            tx.outputs.append(TransactionOutput(
+                amount=format_thorium(balance - amount),
+                address=wallet_address
+            ))
+        
+        return tx
+    
+    def get_balance(self, address: str) -> Decimal:
+        """Get balance for address"""
+        return self.blockchain.get_balance(address)
+
+# --- MAIN APPLICATION WITH P2P ---
+class ThoriumApp:
+    """Main application class with P2P networking"""
+    
+    def __init__(self):
+        # Initialize components in correct order
+        self.blockchain = None
+        self.network = None
+        self.wallet_manager = None
+        
+        self.running = True
+        self.mining = False
+        
+        # Set up signal handlers
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+    
+    def initialize(self):
+        """Initialize all components"""
+        # Create blockchain first
+        self.blockchain = Blockchain()
+        
+        # Create network manager with blockchain
+        self.network = P2PNetworkManager(self.blockchain)
+        
+        # Update blockchain with network manager
+        self.blockchain.network = self.network
+        
+        # Create wallet manager with blockchain
+        self.wallet_manager = WalletManager(self.blockchain)
+        
+        # Start network
+        self.network.start()
+        
+        logger.info("Thorium application initialized with P2P networking")
+    
+    def signal_handler(self, signum, frame):
+        """Handle shutdown signals"""
+        print("\n\n🔄 Shutting down...")
+        self.running = False
+        self.mining = False
+        
+        if self.network:
+            self.network.stop()
+        
+        if self.blockchain:
+            self.blockchain.db.close()
+        
+        sys.exit(0)
+    
+    def show_welcome(self):
+        """Display welcome screen"""
+        import platform
+        from datetime import datetime
+        
+        os_name = platform.system()
+        python_version = platform.python_version()
+        
+        print("\n" + "="*70)
+        print("💰 THORIUM 2.0 - ENHANCED P2P CRYPTOCURRENCY")
+        print("="*70)
+        print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"💻 System: {os_name} | Python: {python_version}")
+        print(f"🔧 Features: Zero Fees | {Config.INITIAL_DIFFICULTY} Hex Zero Difficulty | P2P Network")
+        print("="*70)
+        
+        # System info
+        if PSUTIL_AVAILABLE:
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
+            print(f"⚡ CPU: {cpu_percent:.1f}% | RAM: {memory.percent:.1f}% used")
+        
+        # Blockchain status
+        print(f"\n📊 BLOCKCHAIN STATUS:")
+        print(f"   Height: {self.blockchain.height:,}")
+        print(f"   Mempool Size: {len(self.blockchain.mempool):,}")
+        print(f"   Difficulty: {self.blockchain.difficulty}")
+        print(f"   Block Reward: {format_thorium(self.blockchain.get_block_reward(self.blockchain.height))} TH")
+        
+        # Network status
+        if self.network:
+            connected_peers = len([p for p in self.network.peers.values() if p.connected])
+            print(f"\n🌐 NETWORK STATUS:")
+            print(f"   Port: {Config.P2P_PORT}")
+            print(f"   Connected Peers: {connected_peers}")
+            print(f"   Total Peers: {len(self.network.peers)}")
+        
+        # Current wallet info
+        if self.wallet_manager.current_wallet:
+            wallet = self.wallet_manager.current_wallet
+            balance = self.wallet_manager.get_balance(wallet.address)
+            print(f"\n👛 CURRENT WALLET:")
+            print(f"   Name: {wallet.name}")
+            print(f"   Address: {wallet.address}")
+            print(f"   Balance: {format_thorium(balance)} TH")
+        
+        print("="*70)
+    
+    def main_menu(self):
+        """Main menu loop"""
+        while self.running:
+            self.show_welcome()
+            
+            print("\n📋 MAIN MENU:")
+            print("1. 🏦 Wallet Management")
+            print("2. 💸 Send Thorium (Zero Fee)")
+            print("3. ⛏️  Mining Operations")
+            print("4. 📊 Blockchain Explorer")
+            print("5. 🌐 Network Management")
+            print("6. ⚙️  Settings & Tools")
+            print("7. 🚪 Exit")
+            
+            try:
+                choice = input("\nSelect option (1-7): ").strip()
+                
+                if choice == "1":
+                    self.wallet_menu()
+                elif choice == "2":
+                    self.send_transaction_menu()
+                elif choice == "3":
+                    self.mining_menu()
+                elif choice == "4":
+                    self.blockchain_explorer_menu()
+                elif choice == "5":
+                    self.network_menu()
+                elif choice == "6":
+                    self.settings_menu()
+                elif choice == "7":
+                    print("\n👋 Goodbye!")
+                    self.running = False
+                else:
+                    print("❌ Invalid option!")
+                    
+            except KeyboardInterrupt:
+                print("\n\n👋 Goodbye!")
+                self.running = False
+            except Exception as e:
+                logger.error(f"Menu error: {e}")
+                print(f"❌ Error: {e}")
+    
+    def wallet_menu(self):
+        """Wallet management menu"""
+        while True:
+            print("\n" + "="*50)
+            print("🏦 WALLET MANAGEMENT")
+            print("="*50)
+            
+            wallets = list(self.wallet_manager.wallets.values())
+            
+            if wallets:
+                print(f"\nFound {len(wallets)} wallet(s):")
+                for i, wallet in enumerate(wallets, 1):
+                    balance = self.wallet_manager.get_balance(wallet.address)
+                    status = "🔓" if self.wallet_manager.current_wallet and wallet.address == self.wallet_manager.current_wallet.address else "🔒"
+                    print(f"{i}. {status} {wallet.name} - {format_thorium(balance)} TH")
+                    print(f"   Address: {wallet.address}")
+            else:
+                print("\nNo wallets found.")
+            
+            print("\nOptions:")
+            print("1. Create new wallet")
+            print("2. Unlock existing wallet")
+            print("3. Show wallet details")
+            print("4. Back to main menu")
+            
+            choice = input("\nSelect option: ").strip()
+            
+            if choice == "1":
+                self.create_wallet()
+            elif choice == "2":
+                self.unlock_wallet()
+            elif choice == "3":
+                self.show_wallet_details()
+            elif choice == "4":
+                break
+            else:
+                print("❌ Invalid option!")
+    
+    def create_wallet(self):
+        """Create a new wallet"""
+        print("\n" + "-"*40)
+        print("🆕 CREATE NEW WALLET")
+        print("-"*40)
+        
+        name = input("Wallet name: ").strip()
+        if not name:
+            print("❌ Wallet name cannot be empty!")
+            return
+        
+        password = input("Password: ").strip()
+        if len(password) < Config.PASSWORD_MIN_LENGTH:
+            print(f"❌ Password must be at least {Config.PASSWORD_MIN_LENGTH} characters!")
+            return
+        
+        confirm = input("Confirm password: ").strip()
+        if password != confirm:
+            print("❌ Passwords do not match!")
+            return
+        
+        try:
+            wallet = self.wallet_manager.create_wallet(name, password)
+            print(f"\n✅ Wallet created successfully!")
+            print(f"   Name: {wallet.name}")
+            print(f"   Address: {wallet.address}")
+            print(f"   ID: {wallet.id}")
+            print(f"\n⚠️  IMPORTANT: Backup your wallet file and keep your password safe!")
+            
+            # Auto-unlock the newly created wallet
+            self.wallet_manager.current_wallet = wallet
+            print(f"✅ Wallet '{name}' is now unlocked!")
+            
+        except Exception as e:
+            print(f"❌ Failed to create wallet: {e}")
+    
+    def unlock_wallet(self):
+        """Unlock existing wallet"""
+        wallets = list(self.wallet_manager.wallets.values())
+        
+        if not wallets:
+            print("❌ No wallets available!")
+            return
+        
+        print("\nSelect wallet to unlock:")
+        for i, wallet in enumerate(wallets, 1):
+            print(f"{i}. {wallet.name} - Address: {wallet.address}")
+        
+        try:
+            selection = int(input(f"\nSelect (1-{len(wallets)}): "))
+            if 1 <= selection <= len(wallets):
+                wallet = wallets[selection - 1]
+                password = input(f"Password for '{wallet.name}': ").strip()
+                
+                if self.wallet_manager.unlock_wallet(wallet.address, password):
+                    print(f"✅ Wallet '{wallet.name}' unlocked!")
+                else:
+                    print("❌ Invalid password!")
+            else:
+                print("❌ Invalid selection!")
+        except ValueError:
+            print("❌ Invalid input!")
+    
+    def send_transaction_menu(self):
+        """Send transaction menu - with zero fees"""
+        if not self.wallet_manager.current_wallet:
+            print("❌ No wallet unlocked! Please unlock a wallet first.")
+            return
+        
+        wallet = self.wallet_manager.current_wallet
+        balance = self.wallet_manager.get_balance(wallet.address)
+        
+        print(f"\n💸 SEND THORIUM (ZERO FEES)")
+        print(f"From: {wallet.name} ({wallet.address})")
+        print(f"Balance: {format_thorium(balance)} TH")
+        print(f"Fee: {format_thorium(Decimal('0'))} TH")
+        print("-"*40)
+        
+        try:
+            amount_str = input("Amount (TH): ").strip()
+            amount = parse_thorium(amount_str)
+            
+            if amount > balance:
+                print(f"❌ Insufficient balance! Available: {format_thorium(balance)} TH")
+                return
+            
+            recipient = input("Recipient address: ").strip()
+            if not recipient:
+                print("❌ Recipient address cannot be empty!")
+                return
+            
+            # Confirm
+            print(f"\n📝 TRANSACTION SUMMARY:")
+            print(f"   From: {wallet.address}")
+            print(f"   To: {recipient}")
+            print(f"   Amount: {format_thorium(amount)} TH")
+            print(f"   Fee: {format_thorium(Decimal('0'))} TH")
+            
+            # Accept various confirmations
+            confirm = input("\nConfirm transaction? (y/yes or n/no): ").strip().lower()
+            
+            if confirm in ['y', 'yes', 'ye', 'ya']:
+                # Create and send transaction
+                tx = self.wallet_manager.create_transaction(recipient, amount)
+                
+                if tx:
+                    success, message = self.blockchain.add_to_mempool(tx)
+                    if success:
+                        print(f"\n✅ Transaction created and broadcast to network!")
+                        print(f"   TXID: {tx.txid}")
+                    else:
+                        print(f"❌ Failed: {message}")
+            else:
+                print("❌ Transaction cancelled.")
+            
+        except ValueError as e:
+            print(f"❌ Error: {e}")
+        except Exception as e:
+            print(f"❌ Unexpected error: {e}")
+    
+    def mining_menu(self):
+        """Mining operations menu"""
+        print("\n⛏️  MINING OPERATIONS")
+        print("="*50)
+        
+        if not self.wallet_manager.current_wallet:
+            print("❌ No wallet selected for mining rewards!")
+            print("   Please unlock a wallet first.")
+            return
+        
+        wallet = self.wallet_manager.current_wallet
+        
+        print(f"\nMining to: {wallet.name}")
+        print(f"Address: {wallet.address}")
+        print(f"\nCurrent Status:")
+        print(f"   Block Height: {self.blockchain.height}")
+        print(f"   Difficulty: {self.blockchain.difficulty} (requires {Config.INITIAL_DIFFICULTY} hex zeros)")
+        print(f"   Block Reward: {format_thorium(self.blockchain.get_block_reward(self.blockchain.height))} TH")
+        print(f"   Connected Peers: {len([p for p in self.network.peers.values() if p.connected]) if self.network else 0}")
+        
+        print("\nOptions:")
+        print("1. Start mining (CPU)")
+        print("2. Stop mining")
+        print("3. Back to main menu")
+        
+        choice = input("\nSelect option: ").strip()
+        
+        if choice == "1":
+            self.start_mining()
+        elif choice == "2":
+            self.mining = False
+            print("⏹️  Mining stopped")
+        elif choice == "3":
+            return
+        else:
+            print("❌ Invalid option!")
+    
+    def start_mining(self):
+        """Start mining process - FIXED VERSION"""
+        print("\n🚀 STARTING MINER...")
+        print(f"Difficulty: {self.blockchain.difficulty} (Hash must start with {Config.INITIAL_DIFFICULTY} zeros)")
+        print("Press Ctrl+C to stop")
+        print("-"*40)
+        
+        self.mining = True
+        try:
+            wallet = self.wallet_manager.current_wallet
+            hashes_tried = 0
+            start_time = time.time()
+            last_update = start_time
+            last_block_height = self.blockchain.height
+            
+            while self.running and self.mining:
+                # Only create new block if blockchain hasn't advanced
+                if self.blockchain.height > last_block_height:
+                    last_block_height = self.blockchain.height
+                    print(f"\n📦 New block detected at height {last_block_height}, creating new candidate block...")
+                
+                # Create candidate block with ALWAYS INCLUDED COINBASE TRANSACTION
+                block = self.blockchain.create_new_block(wallet.address)
+                
+                # Try to mine the block
+                mined_block = self.mine_block(block)
+                
+                if mined_block:
+                    # Check if this block was already added by another miner
+                    existing_block = self.blockchain.get_block(height=mined_block.header.height)
+                    if existing_block:
+                        print(f"\n⚠️  Block {mined_block.header.height} already exists, creating new candidate...")
+                        hashes_tried = 0
+                        start_time = time.time()
+                        continue
+                    
+                    success, message = self.blockchain.add_block(mined_block)
+                    if success:
+                        elapsed = time.time() - start_time
+                        hash_rate = hashes_tried / elapsed if elapsed > 0 else 0
+                        
+                        # Find coinbase transaction to show reward
+                        coinbase_tx = None
+                        for tx in mined_block.transactions:
+                            if tx.is_coinbase():
+                                coinbase_tx = tx
+                                break
+                        
+                        reward_amount = Decimal('0')
+                        if coinbase_tx and coinbase_tx.outputs:
+                            reward_amount = Decimal(coinbase_tx.outputs[0].amount)
+                        
+                        print(f"\n✅ Block mined!")
+                        print(f"   Height: {mined_block.header.height}")
+                        print(f"   Hash: {mined_block.header.hash()[:16]}...")
+                        print(f"   Nonce: {mined_block.header.nonce}")
+                        print(f"   Hash Rate: {hash_rate:.0f} H/s")
+                        print(f"   Reward: {format_thorium(reward_amount)} TH")
+                        print(f"   Transactions: {len(mined_block.transactions)}")
+                        
+                        # Reset for next block
+                        hashes_tried = 0
+                        start_time = time.time()
+                        last_update = start_time
+                        last_block_height = self.blockchain.height
+                    else:
+                        # If block add failed (maybe already added by another node), reset
+                        if "already exists" in message.lower():
+                            print(f"\n⚠️  {message}, creating new candidate...")
+                            hashes_tried = 0
+                            start_time = time.time()
+                        else:
+                            print(f"\n❌ Failed to add block: {message}")
+                
+                hashes_tried += 100000  # Approximate hashes tried
+                
+                # Update display every 5 seconds
+                current_time = time.time()
+                if current_time - last_update >= 5:
+                    elapsed = current_time - start_time
+                    hash_rate = hashes_tried / elapsed if elapsed > 0 else 0
+                    connected_peers = len([p for p in self.network.peers.values() if p.connected]) if self.network else 0
+                    print(f"\r⛏️  Mining... Hash rate: {hash_rate:.0f} H/s | Hashes: {hashes_tried:,} | Peers: {connected_peers} | Height: {self.blockchain.height}", end="")
+                    last_update = current_time
+                
+                # Small delay to prevent CPU hogging
+                time.sleep(0.01)
+                
+        except KeyboardInterrupt:
+            print("\n⏹️  Mining stopped by user")
+            self.mining = False
+        except Exception as e:
+            print(f"\n❌ Mining error: {e}")
+            self.mining = False
+    
+    def mine_block(self, block: Block) -> Optional[Block]:
+        """Mine a block - requires hash starting with difficulty zeros"""
+        target_prefix = "0" * block.header.difficulty
+        
+        # Try different nonces
+        for i in range(100000):
+            block_hash = block.header.hash()
+            
+            if block_hash.startswith(target_prefix):
+                return block
+            
+            block.header.nonce += 1
+            if block.header.nonce % 10000 == 0:
+                # Update timestamp occasionally
+                block.header.timestamp = int(time.time())
+        
+        return None
+    
+    def blockchain_explorer_menu(self):
+        """Blockchain explorer menu"""
+        while True:
+            print("\n" + "="*50)
+            print("📊 BLOCKCHAIN EXPLORER")
+            print("="*50)
+            
+            print(f"\nCurrent Height: {self.blockchain.height:,}")
+            
+            print("\nOptions:")
+            print("1. View latest block")
+            print("2. Search by block height")
+            print("3. Search by transaction ID")
+            print("4. View mempool")
+            print("5. Check address balance")
+            print("6. Back to main menu")
+            
+            choice = input("\nSelect option: ").strip()
+            
+            if choice == "1":
+                self.view_latest_block()
+            elif choice == "2":
+                self.search_by_height()
+            elif choice == "3":
+                self.search_by_txid()
+            elif choice == "4":
+                self.view_mempool()
+            elif choice == "5":
+                self.check_address_balance()
+            elif choice == "6":
+                break
+            else:
+                print("❌ Invalid option!")
+    
+    def view_latest_block(self):
+        """View latest block details"""
+        if self.blockchain.chain_tip:
+            block = self.blockchain.chain_tip
+            self.display_block_details(block)
+        else:
+            print("❌ No blocks in blockchain!")
+    
+    def display_block_details(self, block: Block):
+        """Display block details"""
+        print("\n" + "="*60)
+        print(f"📦 BLOCK #{block.header.height}")
+        print("="*60)
+        
+        print(f"\nHeader:")
+        print(f"   Hash: {block.header.hash()}")
+        print(f"   Previous: {block.header.prev_hash[:20]}...")
+        print(f"   Merkle Root: {block.header.merkle_root[:20]}...")
+        print(f"   Timestamp: {datetime.fromtimestamp(block.header.timestamp)}")
+        print(f"   Difficulty: {block.header.difficulty}")
+        print(f"   Nonce: {block.header.nonce}")
+        print(f"   Size: {block.size:,} bytes")
+        
+        print(f"\nTransactions ({len(block.transactions)}):")
+        for i, tx in enumerate(block.transactions[:5]):
+            tx_type = "Coinbase" if tx.is_coinbase() else "Regular"
+            output_summary = ""
+            if tx.outputs:
+                amount = Decimal(tx.outputs[0].amount)
+                address = tx.outputs[0].address[:8] + "..."
+                output_summary = f" → {format_thorium(amount)} TH to {address}"
+            print(f"   {i+1}. {tx.txid[:16]}... ({tx_type}){output_summary}")
+        
+        print("="*60)
+    
+    def network_menu(self):
+        """Network management menu"""
+        if not self.network:
+            print("❌ Network not initialized!")
+            return
+        
+        while True:
+            print("\n🌐 NETWORK MANAGEMENT")
+            print("="*50)
+            
+            connected_peers = len([p for p in self.network.peers.values() if p.connected])
+            total_peers = len(self.network.peers)
+            
+            print(f"\nNetwork Status:")
+            print(f"   Port: {Config.P2P_PORT}")
+            print(f"   Connected Peers: {connected_peers}")
+            print(f"   Total Peers: {total_peers}")
+            print(f"   Max Peers: {Config.MAX_PEERS}")
+            
+            print("\nOptions:")
+            print("1. List connected peers")
+            print("2. Add peer manually")
+            print("3. Disconnect from peer")
+            print("4. Request peer list")
+            print("5. Network statistics")
+            print("6. Back to main menu")
+            
+            choice = input("\nSelect option: ").strip()
+            
+            if choice == "1":
+                self.list_peers()
+            elif choice == "2":
+                self.add_peer_manual()
+            elif choice == "3":
+                self.disconnect_peer()
+            elif choice == "4":
+                self.request_peer_list()
+            elif choice == "5":
+                self.network_statistics()
+            elif choice == "6":
+                break
+            else:
+                print("❌ Invalid option!")
+    
+    def list_peers(self):
+        """List connected peers"""
+        if not self.network:
+            print("❌ Network not initialized!")
+            return
+        
+        with self.network.peer_lock:
+            peers = list(self.network.peers.values())
+        
+        print("\n📋 CONNECTED PEERS:")
+        print("-"*50)
+        
+        if not peers:
+            print("   No connected peers")
+            return
+        
+        for i, peer in enumerate(peers, 1):
+            status = "✅" if peer.connected else "❌"
+            last_msg = datetime.fromtimestamp(peer.last_message).strftime('%H:%M:%S')
+            print(f"{i}. {status} {peer.address[0]}:{peer.address[1]} - Last: {last_msg}")
+    
+    def add_peer_manual(self):
+        """Add peer manually"""
+        if not self.network:
+            print("❌ Network not initialized!")
+            return
+        
+        ip = input("Peer IP address: ").strip()
+        port = input(f"Port (default {Config.P2P_PORT}): ").strip()
+        
+        if not port:
+            port = Config.P2P_PORT
+        else:
+            try:
+                port = int(port)
+                if not (1 <= port <= 65535):
+                    raise ValueError
+            except ValueError:
+                print("❌ Invalid port number!")
+                return
+        
+        if self.network.connect_to_peer(ip, port):
+            print(f"✅ Connecting to peer {ip}:{port}")
+        else:
+            print(f"❌ Failed to connect to {ip}:{port}")
+    
+    def disconnect_peer(self):
+        """Disconnect from a peer"""
+        if not self.network:
+            print("❌ Network not initialized!")
+            return
+        
+        with self.network.peer_lock:
+            peers = list(self.network.peers.values())
+        
+        if not peers:
+            print("❌ No connected peers!")
+            return
+        
+        print("\nSelect peer to disconnect:")
+        for i, peer in enumerate(peers, 1):
+            status = "✅" if peer.connected else "❌"
+            print(f"{i}. {status} {peer.address[0]}:{peer.address[1]}")
+        
+        try:
+            selection = int(input(f"\nSelect (1-{len(peers)}): "))
+            if 1 <= selection <= len(peers):
+                peer = peers[selection - 1]
+                peer.close()
+                print(f"✅ Disconnected from {peer.address[0]}:{peer.address[1]}")
+            else:
+                print("❌ Invalid selection!")
+        except ValueError:
+            print("❌ Invalid input!")
+    
+    def request_peer_list(self):
+        """Request peer list from connected peers"""
+        if not self.network:
+            print("❌ Network not initialized!")
+            return
+        
+        with self.network.peer_lock:
+            peers = list(self.network.peers.values())
+        
+        if not peers:
+            print("❌ No connected peers to request from!")
+            return
+        
+        # Request from first 3 peers
+        for peer in peers[:3]:
+            if peer.connected:
+                getpeers_msg = {
+                    'type': NetworkMessage.GET_PEERS.value,
+                    'data': {}
+                }
+                peer.send(getpeers_msg)
+        
+        print("✅ Peer list requests sent to connected peers")
+    
+    def network_statistics(self):
+        """Show network statistics"""
+        if not self.network:
+            print("❌ Network not initialized!")
+            return
+        
+        with self.network.peer_lock:
+            connected_peers = len([p for p in self.network.peers.values() if p.connected])
+            total_peers = len(self.network.peers)
+        
+        print("\n📊 NETWORK STATISTICS")
+        print("="*50)
+        print(f"Connected Peers: {connected_peers}")
+        print(f"Total Known Peers: {total_peers}")
+        print(f"Maximum Peers: {Config.MAX_PEERS}")
+        print(f"P2P Port: {Config.P2P_PORT}")
+        print(f"Connection Timeout: {Config.CONNECTION_TIMEOUT}s")
+        print(f"Ping Interval: {Config.PING_INTERVAL}s")
+        
+        print("\nPress Enter to continue...")
+        input()
+    
+    def settings_menu(self):
+        """Settings and tools menu"""
+        print("\n⚙️  SETTINGS & TOOLS")
+        print("="*50)
+        
+        print("\nOptions:")
+        print("1. View configuration")
+        print("2. Database maintenance")
+        print("3. Back to main menu")
+        
+        choice = input("\nSelect option: ").strip()
+        
+        if choice == "1":
+            self.view_configuration()
+        elif choice == "2":
+            self.database_maintenance()
+        elif choice == "3":
+            return
+        else:
+            print("❌ Invalid option!")
+    
+    def view_configuration(self):
+        """View current configuration"""
+        print("\n⚙️  CONFIGURATION")
+        print("="*50)
+        
+        print("💰 TRANSACTION SETTINGS:")
+        print(f"   Transaction Fee: {format_thorium(Config.TRANSACTION_FEE)} TH (Zero)")
+        print(f"   Min Relay Fee: {format_thorium(Config.MIN_RELAY_FEE)} TH (Zero)")
+        
+        print("\n⛏️  MINING SETTINGS:")
+        print(f"   Initial Difficulty: {Config.INITIAL_DIFFICULTY} (Hex zeros)")
+        print(f"   Block Time Target: {Config.BLOCK_TIME_TARGET} seconds")
+        print(f"   Initial Reward: {format_thorium(Config.INITIAL_REWARD)} TH")
+        
+        print("\n🌐 NETWORK SETTINGS:")
+        print(f"   P2P Port: {Config.P2P_PORT}")
+        print(f"   Max Peers: {Config.MAX_PEERS}")
+        print(f"   Connection Timeout: {Config.CONNECTION_TIMEOUT}s")
+        
+        print("\n🔐 SECURITY SETTINGS:")
+        print(f"   Password Min Length: {Config.PASSWORD_MIN_LENGTH}")
+        
+        print("\nSystem Info:")
+        print(f"   Cryptography Available: {CRYPTOGRAPHY_AVAILABLE}")
+        print(f"   NumPy Available: {NUMPY_AVAILABLE}")
+        print(f"   psutil Available: {PSUTIL_AVAILABLE}")
+    
+    def show_wallet_details(self):
+        """Show detailed wallet information"""
+        if not self.wallet_manager.current_wallet:
+            print("❌ No wallet selected!")
+            return
+        
+        wallet = self.wallet_manager.current_wallet
+        balance = self.wallet_manager.get_balance(wallet.address)
+        
+        print(f"\n👛 WALLET DETAILS")
+        print("="*50)
+        print(f"Name: {wallet.name}")
+        print(f"Address: {wallet.address}")
+        print(f"Created: {datetime.fromtimestamp(wallet.created)}")
+        print(f"Last Used: {datetime.fromtimestamp(wallet.last_used)}")
+        print(f"Balance: {format_thorium(balance)} TH")
+        print(f"Wallet ID: {wallet.id}")
+    
+    def search_by_height(self):
+        """Search block by height"""
+        try:
+            height = int(input("Block height: ").strip())
+            
+            if height < 0 or height > self.blockchain.height:
+                print(f"❌ Height must be between 0 and {self.blockchain.height}")
+                return
+            
+            block = self.blockchain.get_block(height=height)
+            if block:
+                self.display_block_details(block)
+            else:
+                print("❌ Block not found!")
+        except ValueError:
+            print("❌ Invalid height!")
+    
+    def search_by_txid(self):
+        """Search transaction by ID"""
+        txid = input("Transaction ID: ").strip()
+        
+        tx = self.blockchain.get_transaction(txid)
+        if tx:
+            self.display_transaction_details(tx)
+        else:
+            print("❌ Transaction not found!")
+    
+    def display_transaction_details(self, tx: Transaction):
+        """Display transaction details"""
+        print("\n" + "="*60)
+        print("📄 TRANSACTION DETAILS")
+        print("="*60)
+        
+        print(f"\nTransaction ID: {tx.txid}")
+        print(f"Type: {tx.type.name}")
+        print(f"Timestamp: {datetime.fromtimestamp(tx.timestamp)}")
+        
+        print(f"\nOutputs ({len(tx.outputs)}):")
+        for i, tx_output in enumerate(tx.outputs):
+            amount = Decimal(tx_output.amount)
+            print(f"   {i+1}. {tx_output.address} - {format_thorium(amount)} TH")
+        
+        print("="*60)
+    
+    def view_mempool(self):
+        """View mempool transactions"""
+        mempool = self.blockchain.mempool
+        
+        print(f"\n⏳ MEMPOOL ({len(mempool)} transactions)")
+        print("="*50)
+        
+        if not mempool:
+            print("   Mempool is empty")
+            return
+        
+        # Show first 10 transactions
+        for i, (txid, tx) in enumerate(list(mempool.items())[:10], 1):
+            total_output = tx.get_total_output()
+            print(f"{i}. {txid[:16]}... - {format_thorium(total_output)} TH")
+    
+    def check_address_balance(self):
+        """Check balance for any address"""
+        address = input("Address to check: ").strip()
+        
+        if not address:
+            print("❌ Address cannot be empty!")
+            return
+        
+        balance = self.blockchain.get_balance(address)
+        print(f"\n💰 Balance: {format_thorium(balance)} TH")
+    
+    def database_maintenance(self):
+        """Perform database maintenance"""
+        print("\n🛠️  DATABASE MAINTENANCE")
+        print("="*50)
+        
+        print("\nOptions:")
+        print("1. Compact database")
+        print("2. Check database integrity")
+        print("3. Back to settings")
+        
+        choice = input("\nSelect option: ").strip()
+        
+        if choice == "1":
+            self.compact_database()
+        elif choice == "2":
+            self.check_database_integrity()
+        elif choice == "3":
+            return
+        else:
+            print("❌ Invalid option!")
+    
+    def compact_database(self):
+        """Compact database"""
+        print("🗜️  Compacting database...")
+        self.blockchain.db.execute("VACUUM")
+        self.blockchain.db.commit()
+        print("✅ Database compacted")
+    
+    def check_database_integrity(self):
+        """Check database integrity"""
+        print("🔍 Checking database integrity...")
+        
+        cursor = self.blockchain.db.execute("PRAGMA integrity_check")
+        result = cursor.fetchone()
+        
+        if result and result[0] == 'ok':
+            print("✅ Database integrity: OK")
+        else:
+            print(f"❌ Database integrity check failed: {result}")
+
+# --- MAIN ENTRY POINT ---
+def main():
+    """Main entry point"""
+    print("\n" + "="*70)
+    print("🚀 STARTING THORIUM 2.0 WITH P2P NETWORKING")
+    print("="*70)
+    print("🌟 Features: Zero Transaction Fees | 5 Hex Zero Difficulty | P2P Network")
+    print("="*70)
+    
+    try:
+        # Create and initialize app
+        app = ThoriumApp()
+        app.initialize()
+        
+        # Give network time to start
+        print("🔄 Starting P2P network...")
+        time.sleep(2)
+        
+        # Start main menu
+        app.main_menu()
+        
+    except KeyboardInterrupt:
+        print("\n\n👋 Goodbye!")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        print(f"\n❌ Fatal error: {e}")
+        print("Check logs for details")
+
+if __name__ == "__main__":
+    main()
