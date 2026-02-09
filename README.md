@@ -1,2 +1,2 @@
 # thorium_
-thorium is a cryptocurrency i made... its mostly for fun and made for raspberry PIs. I learned a lot making it i hope you can too using it
+thorium is a cryptocurrency i made... its mostly for fun and made for raspberry PIs. I learned a lot making it i hope you can too using it. Plus thorium is fully FEE FREE. i hope you guys can learn from it. PLEASE DO NOT SHARE IPS ONLINE I MADE A SMALL MISTAKE MAKING PEER TO PEER ADDING NEEDING AN IP ONLY ADD PEOPLE YOU ACTUALY KNOW. IN THE MEENWILE im working on a thorium for actaul transactions using c++ not needing ips better security ect. HAVE FUN and learn. :)
